@@ -19,6 +19,8 @@ Para el análisis exploratorio y redacción del documento nos ha bastado un PC p
 
 Finalmente, estas líneas y el código se han escrito en un _notebook_ de RStudio. 
 
+Todo el código está disponible en un [repositorio](https://github.com/lhansa/rotten-tomatoes) público de Github.
+
 ```{r libs, message=FALSE}
 library(tidyverse)
 library(caret)
@@ -726,3 +728,5 @@ Como siguientes pasos proponemos:
 - Muestra mayor. 
 - Modelo más complejo, con mayor estudio de hiperparámetros y una validación cruzada con repeticiones. 
 - Pruebas con otros algoritmos, fácilmente implementables con `caret`. 
+
+</br>
