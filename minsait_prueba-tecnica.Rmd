@@ -1,0 +1,728 @@
+---
+title: "Minsait. Prueba de selección"
+author: "Leonardo T. Hansa"
+date: "Noviembre 2018"
+output: html_notebook
+---
+
+## Análisis de sentimiento
+
+Se nos pide proporcionar una etiqueta de sentimiento de un texto en base a un conjunto de datos previamente etiquetado. Estas etiquetas nos servirán para construir un modelo que podremos aplicar sobre el conjunto de datos _test._
+
+## Inicialización
+
+El análisis lo hemos llevado a cabo en R. Hemos basado el tratamiento de datos en el universo _tidyverse_ de Hadley Wickham y en la librería `tm`. También específico de minería de textos nos hemos apoyado en `qdap`, para parte del tratamiento del corpus. Para el modelo empleamos la sintaxis de `caret`.
+
+Hemos usado `wordcloud` para una nube de palabras, aunque la visualización la protagoniza `ggplot2.` Para unos cambios automáticos en los nombres de las columnas de los datos hemos aplicado la función `janitor::clean_names`. 
+
+Para el análisis exploratorio y redacción del documento nos ha bastado un PC pero para el cómputo del modelo, anáisis de sus resultados y preparación de parte de los datos hemos desplegado una instancia EC2 de Amazon Web Services. 
+
+Finalmente, estas líneas y el código se han escrito en un _notebook_ de RStudio. 
+
+```{r libs, message=FALSE}
+library(tidyverse)
+library(caret)
+library(wordcloud)
+library(tm)
+library(qdap)
+library(magrittr)
+```
+
+Leemos los conjuntos de datos con el paquete `readr`. Nos apoyamos en `janitor::clean_names()` para adaptar los nombres de las variables a un formato estándar.
+
+```{r lectura-datos,message=FALSE}
+df_train <- read_tsv("data/train.tsv") %>% 
+  janitor::clean_names()
+```
+
+## Una primera exploración 
+
+De los 156.060 registros, 80.000 (del orden de la mitad) están etiquetados como neutros. En el siguiente gráfico se observa además una simetría entre el número de registros negativos y positivos. 
+
+```{r dist-sentimiento}
+ggplot(df_train, aes(x = sentiment)) + 
+  geom_bar()
+```
+
+Una pregunta que surge es, en cada crítica, cuántas etiquetas distintas puede haber. Tengamos en cuenta que hay un total de 8.529 críticas. En el siguiente gráfico vemos que el grupo mayoritario es el de críticas con tres sentimientos diferentes entre sus segmentos. También se observa que hay más críticas con las cinco etiquetas que sólo con una.
+
+```{r etiquetas-por-oracion}
+df_train %>% 
+  count(sentence_id, sentiment) %>% 
+  count(sentence_id) %>% 
+  ggplot(aes(x = nn)) + 
+  geom_bar() +
+  labs(x = "Número de etiquetas")
+```
+
+
+Echaremos un vistazo a algunas de las críticas completas y sus etiquetas. Pese a que del orden del 50% de los fragmentos son neutros, las críticas parecen tener un sentimiento más inclinado hacia uno de los dos extremos. Tiene sentido pensar que cuando se fragmentan las críticas en fragmentos pequeños se pierda el significado original y falte información para etiquetarlo con un sentimiento, por lo que queda como neutro.
+
+Para detectar la crítica completa, buscamos a nivel de `sentence_id` el fragmento de mayor longitud. 
+
+```{r muestra-críticas-completas-etiq}
+filtra_oraciones_completas <- function(.data){
+  .data %>% 
+    mutate(longitud = str_length(phrase)) %>% 
+    group_by(sentence_id) %>% 
+    filter(longitud == max(longitud)) %>%  
+    ungroup() %>% 
+    select(-longitud)
+}
+```
+
+A nivel de crítica, se observa aún una simetría entre los extremos 0-4 y 1-3, de manera similar al caso de los fragmentos. Pero ahora son algo más de 1.500 críticas las que están etiquetadas como neutras, en torno a un 20% (proporción menor que el 50% anterior).
+
+```{r dist-etiquetas-criticas-completas}
+df_train %>% 
+  filtra_oraciones_completas() %>% 
+  ggplot(aes(x = sentiment)) + 
+  geom_bar()
+```
+
+
+### Sobre los fragmentos
+
+Tengamos en cuenta que las etiquetas vienen a nivel de fragmento y no de crítica completa (aunque esta también tiene su etiqueta de sentimiento). Para realizar el modelo vamos a necesitar trabajar a nivel de fragmento. 
+
+En el siguiente gráfico relacionamos el sentimiento de una frase con el número de palabras que contiene. 
+
+```{r conteo-palabras-por-sentimiento}
+df_train %>%
+  mutate(num_palabras = str_count(phrase, "\\S+")) %>% 
+  ggplot(aes(x = num_palabras)) + 
+  geom_histogram(binwidth = 1) + 
+  facet_grid(sentiment~., scales = "free")
+```
+
+En todos los grupos observamos una asimetría común pero las distribuciones sí presentan diferencias entre los grupos. Concretamente, la dispersión en los fragmentos etiquetados como neutros (2) es mucho menor que en los otros cuatro. Con una tabla podemos entrar en más detalle. 
+
+```{r conteo-palabras-por-sentimiento2}
+df_train %>%
+  mutate(num_palabras = str_count(phrase, "\\S+")) %>% 
+  group_by(sentiment) %>% 
+  summarise(
+    minimo = min(num_palabras, na.rm = TRUE), 
+    q1 = quantile(num_palabras, probs = 0.25, na.rm = TRUE), 
+    mediana = median(num_palabras, na.rm = TRUE), 
+    media = mean(num_palabras, na.rm = TRUE), 
+    q3 = quantile(num_palabras, probs = 0.75, na.rm = TRUE), 
+    maximo = max(num_palabras, na.rm = TRUE)
+  )
+```
+
+Los grupos extremos, etiquetados con _positivo_ o _negativo_, son los que más longitud presentan. Es razonable pensar que cuanto más larga sea la frase, más fácil será detectar el sentimiento que transmite. Los grupos matizados, _algo positivo_ y _algo negativo_ tienden a estar formados por frases más cortas. Y las frases neutras son en general más cortas que las demás. 
+
+Esto es importante de cara a un muestreo que proponemos para la modelización. Con el siguiente gráfico observamos que en las frases de menor longitud, el sentimiento predominante es el neutro. A medida que los fragmentos toman más palabras, la distribución de sentimientos se equilibran. 
+
+```{r}
+df_train %>%
+  mutate(num_palabras = str_count(phrase, "\\S+")) %>% 
+  ggplot(aes(x = num_palabras, fill = as.factor(sentiment))) + 
+  geom_histogram(binwidth = 1) + 
+  scale_fill_brewer(palette = "Set1")
+```
+
+
+Veamos la distribución del número de palabras por fragmento a nivel general.
+
+```{r conteo-palabras}
+df_train %>%
+  mutate(num_palabras = str_count(phrase, "\\S+")) %>% 
+  use_series(num_palabras) %>% 
+  summary()
+```
+
+Lo primero que salta a la vista que es que hay un fragmento sin palabras (y aún no hemos hecho una limpieza del corpus; más adelante habrá que revisar esto de nuevo). Otro dato importante es que al menos el 25% de los registros tienen una o dos palabras: salvo que incluyan palabras muy evidentes, puede ser arriesgado entender un sentimiento de fragmentos tan cortos y deberemos decidir también cómo lidiar con ellos de cara al modelo. 
+
+Veamos cuál es la crítica sobre la que se ha construido un fragmento vacío.
+
+```{r revision-dato-nulo}
+df_train %>% 
+  filter(sentence_id == df_train %>% 
+           filter(is.na(phrase)) %>% 
+           use_series(sentence_id))
+```
+Todos los fragmentos de la crítica se han etiquetado como neutrales, salvo el vacío y _"contrived"_ (forzado), que aparecen etiquetados como _algo negativo._ 
+
+Procedemos eliminando el registro con valor nulo en `phrase.` Además, guardamos el nuevo conjunto de datos en disco porque lo aprovecharemos más adelante. Guardamos en formato `rds` para optimizar su posterior lectura.  
+
+```{r eliminacion-dato-vacio}
+df_train <- df_train %>% 
+  filter(!is.na(phrase)) %>% 
+  write_rds("data/df-train_no-NA.rds")
+```
+
+Para realizar cualquier análisis, necesitaremos tratar los datos con herramientas adecuadas a la minería de textos. Este tratamiento lo aprovecharemos también para el desarrollo del modelo que queremos plantear. 
+
+## Exploración a nivel de crítica completa
+
+Planteamos en este apartado un análisis estándar de minería de textos de las críticas completas. La etiqueta de sentimiento está presente sólo para el caso de los fragmentos pero trabajar una exploración a nivel de críticas completas nos simplificará el primer entendimiento de los datos. 
+
+Nos apoyaremos principalmente en las herramientas de la librería `tm` de R. `doc2vec` es otro [alternativa](https://www.r-bloggers.com/twitter-sentiment-analysis-with-machine-learning-in-r-using-doc2vec-approach/) usada en R pero en esta ocasión nos hemos decantado por la primera, por mayor conocimiento. 
+
+```{r crea-train-corpus-criticas, eval=FALSE}
+train_corpus <- df_train %>% 
+  filtra_oraciones_completas() %>% 
+  magrittr::use_series(phrase) %>% 
+  VectorSource() %>% 
+  VCorpus()
+```
+
+`train_corpus` es un objeto de R con el que guardamos los elementos de texto con los que queremos trabajar, que a menudo son documentos aunque, en nuestro caso, de cara a la exploración, son críticas (algo habitual es que sean _tuits_).
+
+Una forma habitual de proceder en un análisis de minería de textos y, concretamente, sentimiento, es eliminar elementos que no aportan significado: 
+
+- Se pasa el texto a letra minúscula.
+- Se eliminan signos de puntuación. 
+- Se limita el número de espacios en blanco a los necesarios. 
+
+Nos hemos apoyado en la librería `qdap` solo para parte de limpieza pero es útil para adaptar rasgos de los textos que dificultan los análisis, como números, símbolos, abreviaciones, ... Con esta librería pasaremos a texto determinados caracteres. 
+
+Estas técnicas de minería de textos son importantes para limpiar conjuntos de datos con demasiado ruido (palabras que no aportan significado, símbolos, etcétera) y, aparte de en la exploración, la hemos tenido en cuenta en el tratamiento del conjunto de datos para el modelo. En el entrenamiento, querremos eliminar todo el ruido posible para que no construya reglas que no tengan valor.
+
+Con la función `tm::tm_map()` aplicamos algunas de estas herramientas al corpus que hemos generado. Sobreescribimos el corpus de entrenamiento por ahorro de memoria. 
+
+**Observación.** Hemos definido una función que nos limpia el corpus con algunas de las reglas que hemos comentado. En primer lugar, la planteamos de manera sencilla pero más adelante veremos que hemos incluido una funcionalidad funcionalidades. 
+
+```{r func-limpia-corpus-1,eval=FALSE}
+limpia_corpus <- function(corpus){
+  corpus %>% 
+    tm_map(removePunctuation) %>%
+    tm_map(removeNumbers) %>% 
+    tm_map(content_transformer(tolower)) %>% 
+    tm_map(removeWords, c(stopwords("en"))) %>% 
+    tm_map(stripWhitespace) %>% 
+    return()
+}
+```
+
+Las transformaciones que hace la función sobre el corpus, por ahora, son:
+
+- Eliminación de los signos de puntuación. 
+- Eliminación de números (la librería `qdap` permite sustituirlos por texto, pero prescindiremos de ellos para un primer análisis).
+- Cambio a minúscula. 
+- Eliminación de _stopwords,_ que incluye preposiciones, pronombres, determinantes, etc, funcionalidad de la librería `qdap.`
+- Eliminación de espacios en blanco duplicados.
+
+```{r tratamiento-corpus,eval=FALSE}
+train_corpus <- limpia_corpus(train_corpus)
+gc()
+```
+
+Tanto de cara a la presente exploración como al análisis de sentimiento, relacionaremos las etiquetas de las frases con las palabras que contienen. Para ello necesitamos construir variables numéricas que podamos incluir en un modelo, que aprenderá qué palabras se asocian con cada etiqueta. 
+
+Una opción para ello es plantear una *matriz de documentos y términos*. En nuestro problema, las filas de la matriz serán las frases; las palabras serán las columnas. En un primer momento hemos trabajado con un conteo de palabras por frase. Para el modelo hemos recurrido a la métrica _tfidf,_ que explicaremos más adelante. 
+
+De nuevo, nos apoyamos en las herramientas de `tm`.
+
+```{r matriz-term-1,eval=FALSE}
+train_m <- train_corpus %>% 
+  DocumentTermMatrix() %>% 
+  as.matrix()
+
+gc()
+```
+
+Esta disposición de los datos facilita algunas visualizaciones.
+
+```{r barplot-word-freqs-1, eval=FALSE}
+palabras <- colnames(train_m)
+frecuencias <- colSums(train_m)
+
+data_frame(palabra = palabras,
+           frecuencia = frecuencias) %>% 
+  arrange(desc(frecuencia)) %>% 
+  top_n(5) %>% 
+  ggplot(aes(x = reorder(palabra, frecuencia), y = frecuencia)) + 
+  geom_col() + 
+  coord_flip()
+```
+
+```{r barplot-word-freqs-1b, echo=FALSE}
+read_rds("tmp/grafico-barras_palabras_freqs.rds")
+```
+
+
+Entre las cinco palabras más frecuentes en el corpus tenemos _film,_ y _movie,_ algo esperable dado que estamos trabajando con críticas de películas. Es razonable pensar que estas dos palabras no nos aportarán significado relevante, por lo que las suprimimos del corpus. Encontramos también las palaras _rrb_ y _lrb,_ en referencia a los paréntesis derecho e izquierdo. Las eliminamos también. 
+
+Con lo dicho, ampliamos nuestra función `limpia_corpus` aprovechando las herramientas de `tm`. 
+
+```{r func-limpia-corpus-2}
+palabras_excluidas <- c("film", "movie", "rrb", "lrb")
+
+limpia_corpus <- function(corpus){
+  corpus %>% 
+    tm_map(removePunctuation) %>%
+    tm_map(removeNumbers) %>% 
+    tm_map(content_transformer(tolower)) %>% 
+    tm_map(removeWords, c(stopwords("en"), palabras_excluidas)) %>% 
+    tm_map(stripWhitespace) %>% 
+    return()
+}
+```
+
+Y aplicamos la función sobre el corpus con el que estamos trabajando. 
+
+```{r matriz-term-2, eval=FALSE}
+rm(train_m); gc()
+train_corpus <- limpia_corpus(train_corpus)
+
+train_m <- train_corpus %>% 
+  DocumentTermMatrix() %>% 
+  as.matrix()
+
+gc()
+```
+
+```{r barplot-word-freqs-2, eval=FALSE}
+palabras <- colnames(train_m)
+frecuencias <- colSums(train_m)
+
+data_frame(palabra = palabras,
+           frecuencia = frecuencias) %>% 
+  arrange(desc(frecuencia)) %>% 
+  top_n(20) %>% 
+  ggplot(aes(x = reorder(palabra, frecuencia), y = frecuencia)) + 
+  geom_col() + 
+  coord_flip()
+```
+
+```{r barplot-word-freqs-2b, echo=FALSE}
+read_rds("tmp/grafico-barras_palabras_freqs-2.rds")
+```
+
+La palabra _like_ tiene mucho protagonismo, pero puede referirse al verbo _gustar_ o a la conjunción _como._ _Good_ y _funny_ sí tienen signicados claros. 
+
+Una alternativa habitual de visualización en estos casos son las nubes de palabras, a las que intentaremos sacar partido más adelante, cuando incluyamos los datos de sentimientos.
+
+```{r wordcloud-1, eval = FALSE}
+df_wordcloud_aux <- data_frame(palabra = palabras,
+           frecuencia = frecuencias) %>% 
+  arrange(desc(frecuencia)) %>% 
+  top_n(50)
+
+rm(palabras, frecuencias)
+wordcloud(df_wordcloud_aux$palabra, df_wordcloud_aux$frecuencia)
+rm(df_wordcloud_aux); gc()
+```
+
+```{r wordcloud-data-frame, include = FALSE}
+df_wordcloud_aux <- read_rds("tmp/df_wordcloud_aux.rds")
+```
+
+
+```{r delete-df-aux-1, echo=FALSE}
+wordcloud(df_wordcloud_aux$palabra, df_wordcloud_aux$frecuencia)
+rm(df_wordcloud_aux); gc()
+```
+
+## Tratamiento de datos para el análisis de sentimiento
+
+Hemos aprovechado parte del código previo para tratar los datos de cara al análisis objetivo. Para ello, en lugar de trabajar con las críticas completas, trabajaremos con las frases que tienen etiqueta.
+
+En principio, necesitamos directamente una estructura como la matriz de documentos y términos, que construimos a partir de un corpus limpio, de acuerdo con las condiciones anteriores.
+
+No obstante la aplicación `as.matrix()` da problemas de memoria si la aplicamos sobre todo el corpus. Las opciones que tenemos son: 
+
+- Eliminar fragmentos de sólo una ó dos palabras, que, como vimos antes, son numerosos. 
+- Simplificar la matriz con la opción `control` en la función `DocumentTermMatrix`, de forma que excluyamos términos que aparecen en muy pocos fragmentos y reduzcamos el número de columnas de la matriz con la que queremos trabajar. O equivalentemente, 
+- emplear la función `tm::removeSparseTerms` para eliminar términos que aparecen en muy pocos fragmentos. 
+
+Recordemos, en cualquier caso, que un objeto de la clase `DocumentTermMatrix` es una matriz dispersa ( _sparse_ ) y puede ser empleado como entrada en varios modelos en R, como _xgboost_ o _random forest._
+
+Si bien vimos al principio que hay muchos fragmentos con solo una o dos palabras, sería emplear un filtro demasiado directo, cuando tenemos opciones dentro de las herramientas habituales de TM. Finalmente nos hemos decantado eliminar términos que aparecen en muy pocos documentos. Concretamos más adelante. 
+
+## Planteamiento del modelo
+
+Como hemos mencionado más arriba, un modelo necesita variables numéricas para aprender los patrones que hay detrás de las etiquetas de sentimientos. Esa transformación numérica la hemos trabajado como hemos mostrado en líneas anteriores. 
+
+De cara al planteamiento del modelo nos hemos apoyado en `caret,` que permite emplear la misma sintaxis para probar con diferentes algoritmos o preprocesamientos de datos. Aquí mostramos los resultados obtenidos con SVM, inspirados por [otros estudios](https://blog.lftechnology.com/predicting-sentiment-on-news-data-45c5c22ec2e3) de análisis de sentimiento. 
+
+En la [web se recomienda](https://dragoshmocrii.com/solution-kernlab-class-probability-calculations-failed-returning-nas/) trabajar con fórmulas con `caret::train` y modelos SVM, en lugar de `x = ` en lugar de una fórmula. Para el cambio necesitamos un data frame. El inconveniente que tiene esto es que ocupa más en memoria que una matriz. 
+
+Si bien hemos planteado el modelo con una muestra muy pequeña, hemos decidido desplegar una instancia EC2 de Amazon Web Services en la que trabajar el modelo y la preparación de datos. Concretamente, la parte principal de cómputo la hemos realizado en una instancia t2.2xlarge de 32GB de RAM. No obstante, hemos sometido al conjunto de datos de entrenamiento a un fuerte muestreo, no solo en los términos sino en el número inicial de críticas usadas, dado que la máquina no era capaz de computar un modelo tales volúmenes de información. 
+
+Entramos ahora en detalle de los pasos seguidos. 
+
+### Lectura de datos y muestreo
+
+Explicamos los pasos desde el comienzo, por lo que comenzamos con la lectura de datos. Aprovechamos, en cualquier caso, lo avanzado previamente. A saber, habíamos detectado una frase o fragmento con contenido nulo. El conjunto de datos sin ese registro lo habíamos guardado en disco en formato _rds,_ y ahora podemos leer ese fichero para cargar los datos en memoria. 
+
+Como comentábamos, hemos recurrido a un muestreo del conjunto de datos por necesidades de cómputo. Hemos pensado en dos formas de llevarlo a cabo: 
+
+- Optar por una muestra de los registros. 
+- Optar por una muestra de las críticas completas. 
+
+La razón por la que ha surgido la segunda opción es que, de acuerdo con las observaciones superiores, las críticas completas daban mayor variedad en la variable sentimiento, mientras que en los fragmentos más cortos predominaba el sentimiento neutro. Con este muestreo hemos conseguido dos cosas: 
+
+- Disminuir mucho el conjunto de datos de entrada en el modelo. 
+- Mantener riqueza en la variable objetivo. 
+
+Y esto lo hemos conseguido en poco tiempo. Realmente, con la dedicación necesaria, se podría plantear un muestreo más complejo sobre los fragmentos, manteniendo la distribución de la variable objetivo deseada. Pero una forma de ganar tiempo en esta ocasión ha sido la comentada. 
+
+Por requerimientos de cómputo, no hemos podido trabajar con todas las críticas completas (8.530) pero ha sido suficiente para realizar el ejercicio la muestra de 1.000 elegida. Hacemos uso de `set.seed()` para fijar la semilla de aleatoriedad y poder replicar el experimento.
+
+```{r init-df-muestra, eval=FALSE}
+numero_criticas_elegidas <- 1000
+
+# Lectura del fichero en disco
+df_train <- read_rds("data/df-train_no-NA.rds")
+
+# La función de fitrado de críticas completas está definida más arriba
+filtra_oraciones_completas <- function(.data){
+  .data %>% 
+    mutate(longitud = str_length(phrase)) %>% 
+    group_by(sentence_id) %>% 
+    filter(longitud == max(longitud)) %>%  
+    ungroup() %>% 
+    select(-longitud)
+}
+
+# Eleccción aleatoria de críticas completas
+set.seed(31818)
+df_train <- df_train %>% 
+  filtra_oraciones_completas %>% 
+  sample_n(numero_criticas_elegidas)
+
+# Guardamos en un vector la columna id y la variable objetivo (de la muestra)
+etiqueta_sentimiento <- df_train$sentiment
+fragmentos_id <- df_train$phrase_id
+```
+
+```{r recuperacion-datos, include=FALSE}
+etiqueta_sentimiento <- read_rds("tmp/etiqueta_sentimiento.rds")
+fragmentos_id <- read_rds("tmp/fragmentos_id.rds")
+```
+
+
+### Preparación de la entrada del modelo
+
+Como hemos presentado más arriba, hemos trabajado con herramientas habituales de minería de textos sobre el corpus de datos de entrenamiento. Destacamos dos decisiones. 
+
+La matriz de documentos y términos presentada previamente se construyó con un conteo de palabras por frase. Para el ajuste del modelo, hemos trabajado con la métrica _tfidf._ Este factor, para cada término, tiene en cuenta su frecuencia, pero penaliza aquellos que aparecen en muchos documentos. Es decir, si dos términos tienen frecuencias similares pero uno aparece a lo largo de todo el corpus y el otro sólo aparece en unos pocos documentos (fragmentos, en este caso), el primero saldrá perjudicado. El nombre de la métrica viene del inglés _term frequency - inverse document frequency._
+
+Además de eso, también por necesidades de cómputo en el modelo, hemos optado por exigir una mínima aparición de los términos en el corpus. Esto se puede hacer incluyendo un factor de dispersión en la construcción de la matriz DTM, de forma que términos que no alcancen un mínimo de presencia no se incluyen. 
+
+Con el objetivo de simplificar el proceso de cómputo, ya que al fin y al cabo se obtuvieron buenos resultados, hemos aplicado `tm::removeSparseTerms(0.995)` (50 de cada 1.000).
+
+```{r prepara-matriz, eval=FALSE}
+gc()
+
+train_m <- df_train %>%  
+  magrittr::use_series(phrase) %>%
+  VectorSource() %>%
+  VCorpus() %>%
+  limpia_corpus() %>%
+  DocumentTermMatrix(
+    control = list(
+      weighting = function(x) weightTfIdf(x, normalize =FALSE))) %>% 
+   removeSparseTerms(0.995) %>%
+  as.matrix() %>% 
+  as_data_frame()
+
+rm(df_train); gc()
+```
+
+Para simplificar la exploración posterior, hemos redefinido las etiquetas de sentimientos por la descripción que aparecía en la documentación. 
+
+```{r etiquetas-sentimientos}
+nombres_sentimientos <- c("negative", "somewhat_negative", 
+                          "neutral", 
+                          "somewhat_positive", "positive")
+
+etiquetas <- factor(etiqueta_sentimiento) 
+
+levels(etiquetas) <- nombres_sentimientos
+```
+
+```{r etiquetas-sentimientos-2, eval=FALSE}
+train_m <- train_m %>% 
+  mutate(etiqueta = etiquetas)
+```
+
+
+#### PCA. Una observación
+
+Antes de entrar en el modelo es conveniente que indiquemos que pleanteamos la posibilidad de emplear componentes principales en las variables. Con tal cantidad de columnas en la tabla de entrada (una por palabra), las dimensiones han sido difíciles de tratar y por eso nos hemos visto obligados a realizar un muestro tan intenso. Un PCA nos habría permitido reducir la dimensión de la matriz. 
+
+Ahora bien, al margen de que el análisis en sí también requería bastante capacidad de cómputo, de cara a la predicción sobre el conjunto test nos encontramos con que el modelo se habría entrenado con variables explicativas (las componentes principales) que no estarían presentes en el nuevo conjunto de datos (más adelante explicamos cómo solventamos esto).
+
+Para solventar esto, el PCA se debería hacer con los dos conjuntos unidos. La dimensión de esta unión dificultaba aún más el tratamiento por lo que, a la vista de los resultados obtenidos más adelante, decidimos no trabajar con las componentes principales. En cualquier caso, el código habría tenido un esquema como el que sigue:
+
+```{r pca-data-frame, eval=FALSE}
+pca_m <- prcomp(select(train_m, -etiqueta),
+                      retx = TRUE,
+                      center = TRUE,
+                      scale. = TRUE)$x
+
+train_m <- pca_m %>%
+  mutate(etiqueta = etiquetas)
+```
+
+**Observación.** Con ese código nos quedaríamos con todas las componentes principales. Habría que estudiar su varianza para decidir con cuántas nos quedamos si quisiéramos reducir la dimensión. Para poder realizar luego las predicciones en test, ese código se debería realizar sobre el corpus completo, no solo sobre el objeto `train_m`.
+
+### Modelo SVM
+
+Con el conjunto de datos preparado podemos entrenar el modelo. Nos hemos apoyado en `caret`, librería con sintaxis propia para lidiar de manera automática con varios aspectos de la modelización: 
+
+- Validación cruzada.
+- Modelo elegido.
+- Hiperparámetros del modelo.
+
+Al proponer una forma de estándar de lanzar muchos modelos y algoritmos distintos pero con una sintaxis unificada, con `caret` se simplifican las pruebas de desarrollo de modelos. Por falta de tiempo, hemos probado principalmente máquinas de vectores soporte (SVM). Otras técnicas de clasificación interesantes en este caso habrían sido, por ejemplo, [_random forest_](https://www.researchgate.net/publication/268509189_Sentiment_Mining_of_Movie_Reviews_using_Random_Forest_with_Tuned_Hyperparameters) o [_naive Bayes_](https://medium.com/@martinpella/naive-bayes-for-sentiment-analysis-49b37db18bf8).
+
+Inspirados en la [web](https://blog.lftechnology.com/predicting-sentiment-on-news-data-45c5c22ec2e3), hemos optado por un modelo SVM lineal. La validación cruzada la hemos planteado de manera sencilla. 
+
+```{r train-modelo, eval=FALSE}
+trctrl <- trainControl(method = "cv", number = 2, classProbs =  FALSE)
+
+set.seed(31818)
+fit_model <- train(etiqueta ~ ., 
+                    data = train_m,
+                    method = "svmLinear",
+                    trControl=trctrl,
+                    scale = F)
+
+gc()
+
+write_rds(fit_model, "tmp/svm-linear_sparse-.9975_muestra-criticas-comp.rds", "gz")
+```
+
+```{r}
+fit_model <- read_rds("tmp/svm-linear_sparse-.9975_muestra-criticas-comp.rds")
+fit_model$finalModel
+```
+
+### Aprendizajes
+
+Mostramos, a continuación, una exploración de los resultados. 
+
+```{r recuperacion-datos-train, include=FALSE}
+train_m <- read_rds("tmp/train_m.rds")
+```
+
+En el siguiente gráfico vemos la distribución de críticas en función de la etiqueta de sentimiento, tanto para el caso real como para la predicción del modelo. Vemos que la distribución de la predicción difiere especialmente en los casos neutros, que se están ponderando. 
+
+```{r predicciones-total-plot}
+variables_en_train <- names(train_m)[names(train_m) != "etiqueta"]
+
+predicciones <- predict(fit_model, train_m)
+
+df_real_prediccion <- data_frame(
+  fragmento = fragmentos_id, 
+  real = train_m$etiqueta, 
+  prediccion = predicciones
+)
+
+df_real_prediccion %>% 
+  gather("variable", "valor", real, prediccion) %>% 
+  mutate(valor = factor(valor, levels = nombres_sentimientos), 
+         variable = factor(variable, levels = c("real", "prediccion"))) %>% 
+  ggplot(aes(x = valor, fill = variable)) + 
+  geom_bar(position = "dodge")
+
+```
+
+Hilamos más fino ahora y comparamos la etiqueta de sentimiento fragmento a fragmento. 
+
+```{r predicciones-dif-num}
+conversion_num <- function(x) as.numeric(x) - 1
+
+df_real_prediccion %>% 
+  mutate_at(.vars = vars(real, prediccion), 
+            .funs = funs(conversion_num)) %>% 
+  mutate(diferencia_sentimiento = real - prediccion) %>% 
+  count(diferencia_sentimiento, sort = TRUE) %>% 
+  mutate(pct = n / sum(n))
+```
+De las 1.000 críticas incluidas, 815 se han etiquetado correctamente, un 81,5%. Ha habido 69 en laz que nuestra predicción ha dado una valor menos sentimiento que el real (si la etiqueta correcta era _positivo_ nuestro modelo ha dado _algo positivo_). Nuestra predicción se ha quedado un nivel por encima en la escala del sentimiento en 47 críticas. Y, un comentario más, ha habido 14 críticas en las que el error ha sido de tres niveles, lo que conlleva que una crítica positiva se identifica como algo negativa, por ejemplo. 
+
+```{r errores-extremos}
+fragmentos_errores_extremos_df <- df_real_prediccion %>% 
+  mutate_at(.vars = vars(real, prediccion), 
+            .funs = funs(conversion_num)) %>% 
+  mutate(diferencia_sentimiento = real - prediccion) %>% 
+  filter(abs(diferencia_sentimiento) == 3)
+
+read_rds("data/df-train_no-NA.rds") %>% 
+  filter(phrase_id %in% fragmentos_errores_extremos_df$fragmento) %>% 
+  select(phrase_id, phrase) %>% 
+  inner_join(df_real_prediccion, by = c("phrase_id" = "fragmento"))
+```
+
+## Aplicación sobre el conjunto de test
+
+Para la predicción al conjunto de test tenemos dos puntos clave que considerar: 
+
+- Se requiere predecir sobre todo el conjunto. 
+- Sólo se pueden usar para predecir las palabras que se hayan incluido en el entrenamiento. 
+
+Por ello, hemos dividido el tratamiento de los datos en dos partes. Primero, procedemos de la forma habitual en la construcción de la matriz DTM. En esta ocasión, no aplicamos ningún filtro. Sí aplicamos el cambio de nombres de columnas anterior.
+
+Además, creamos dos vectores, que empleamos en breve:
+
+- Las palabras que están tanto en entrenamiento como en test. 
+- Las palabras que sólo están en entrenamiento. 
+
+Segundo, recuperamos las palabras empleadas en el entrenamiento y nos aseguramos de que las incluimos en la matriz de test, con valor cero.
+
+### Preparación de la matriz DTM
+
+```{r matriz-test, eval=FALSE}
+test_m <- read_tsv("data/test.tsv") %>% 
+  janitor::clean_names()
+
+test_m <- test_m %>% 
+  use_series(phrase) %>%
+  VectorSource() %>%
+  VCorpus() %>%
+  limpia_corpus() %>%
+  DocumentTermMatrix(
+    control = list(
+      weighting = function(x) weightTfIdf(x, normalize =FALSE))) %>% 
+  as.matrix() %>% 
+  as_data_frame()
+
+variables_en_comun <- names(test_m)[names(test_m) %in% variables_en_train]
+variables_solo_train <- variables_en_train[!variables_en_train %in% variables_en_comun]
+```
+
+```{r variables-comun, include=FALSE}
+variables_en_comun <- read_rds("tmp/variables_comun.rds")
+variables_solo_train <- read_rds("tmp/variables_solo_train.rds")
+```
+
+### Aplicación del modelo sobre test
+
+Si todas las palabras estuvieran en ambos conjuntos, sólo sería necesario quitar de test las palabras que no se usaron para entrenar (el modelo no sabría cómo emplearlas para predecir). Si hay palabras en entrenamiento que no están en test, hace falta crearlas en el nuevo conjunto con valor 0. Esta casuística la resolvemos con el siguiente `if()`.
+
+Además, aplicamos la función `predict()` con el objeto del modelo sobre el conjunto de datos tratado.
+
+```{r test-pred, eval=FALSE}
+if(length(variables_solo_train) != 0){
+
+  dots <- map(variables_solo_train, function(x){
+    as.formula("~0")
+  })
+  
+  predicciones_test <- test_m %>% 
+    select(one_of(variables_en_comun)) %>% 
+    mutate_(.dots = set_names(dots, variables_solo_train)) %>% 
+    predict(fit_model, .)  
+  
+} else {
+  
+  predicciones_test <- test_m %>% 
+    select(one_of(variables_en_comun)) %>% 
+    predict(fit_model, .)  
+}
+
+rm(test_m); gc()
+```
+
+### Revisión de predicciones 
+
+Para empezar visualizamos la distribución de fragmentos con cada etiqueta de sentimiento. 
+
+```{r predicciones-test, include=FALSE}
+predicciones_test <- read_rds("tmp/predicciones_test.rds")
+```
+
+```{r viz-sentimient-test}
+ggplot(data_frame(prediccion = predicciones_test), 
+       aes(x = predicciones_test)) + 
+  geom_bar()
+```
+
+Se observa una distribución similar a la de entrenamiento, aunque con mayor proporción de neutros. 
+
+**Observación.** Tengamos en cuenta que debido a los muestreos en _train_, había muy pocas palabras en test que se pudieran utilizar (unas doscientas frente a diez mil, aproximadamente).
+
+Confirmamos que la proporción de fragmentos neutros ha subido a un 60%, aunque el paralelismo entre casos positivos y negativos se mantiene similar. 
+
+```{r test-pred-conteo}
+table(predicciones_test) / length(predicciones_test)
+```
+
+Proponemos ahora una exploración sobre críticas completas. Recuperamos la predicción que les hemos dado y vemos cuáles son las palabras más frecuentes en función del sentimiento. 
+```{r exlore-test, eval=FALSE}
+test_df <- read_tsv("data/test.tsv") %>% 
+  janitor::clean_names()
+
+frases_test <- test_df$phrase_id
+
+frases <- test_df %>% 
+  filtra_oraciones_completas() %>% 
+  magrittr::use_series(phrase_id)
+
+test_df <- test_df %>% 
+  filtra_oraciones_completas() %>% 
+  magrittr::use_series(phrase) %>%
+  VectorSource() %>%
+  VCorpus() %>%
+  limpia_corpus() %>%
+  DocumentTermMatrix() %>% 
+  as.matrix() %>% 
+  as_data_frame()
+
+test_df <- test_df %>%
+  mutate(phrase_id = frases,
+         sentiment = predicciones_test[frases_test %in% frases])
+
+palabras <- test_df %>% 
+  select(-phrase_id, -sentiment) %>% 
+  names()
+
+frecuencias <- test_df %>% 
+  select(-phrase_id, -sentiment) %>% 
+  map_dbl(sum)
+
+hay_positivos <- function(x) any(x > 0)
+
+map(nombres_sentimientos, function(sent){
+  test_df %>%
+    gather("palabra", "frecuencia", -phrase_id, -sentiment) %>% 
+    select(-phrase_id) %>% 
+    filter(sentiment == sent) %>% 
+    group_by(sentiment, palabra) %>% 
+    summarise(frecuencia = sum(frecuencia)) %>% 
+    arrange(desc(frecuencia)) %>% 
+    top_n(20) %>% 
+    ggplot(aes(x = reorder(palabra, frecuencia), y = frecuencia)) + 
+    geom_col() + 
+    coord_flip() + 
+    labs(title = sent)
+})
+```
+
+```{r bar-plots-test, echo=FALSE}
+read_rds("tmp/bar-plots_test.rds")
+```
+
+En los casos positivos, destaca que las palabra más frecuentes son _best_, _love_ y _good_. Los negativos parecen estar peor identificados pero llama la atención la fuerte aparición de potenciadores como _even_ o _much_. 
+
+## Exportación 
+
+```{r exportacion, eval=FALSE}
+read_tsv("data/test.tsv") %>% 
+  select(PhraseId) %>% 
+  mutate(Sentiment = as.integer(conversion_num(predicciones_test))) %>% 
+  write_csv("output/resutado.csv")
+```
+
+## Conclusiones
+
+La cantidad de datos ha dificultado la tarea tanto por tiempos de cómputo como por imposibilidad de tratar algunos puntos. El servicio EC2 de AWS ha facilitado la tarea pero no ha sido suficiente. 
+
+No obstante, los muestreos han permitido desarrollar un modelo con un acierto de un 81% y con resultados intuitivamente razonables, pese a la muestra. 
+
+Respecto a las tecnologías, Python se está usando a menudo en análisis de minería de texto y NLP pero hemos visto que R también tiene herramientas suficientes para hacer un análisis completo. 
+
+Como siguientes pasos proponemos: 
+
+- Mayor exploración de datos, entendiendo relaciones entre las etiquetas de sentimientos y palabras. 
+- Valoración de si un PCA puede aportar una reducción de dimensionalidad considerable. 
+- Muestra mayor. 
+- Modelo más complejo, con mayor estudio de hiperparámetros y una validación cruzada con repeticiones. 
+- Pruebas con otros algoritmos, fácilmente implementables con `caret`. 

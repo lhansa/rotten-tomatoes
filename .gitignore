@@ -1,0 +1,10 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+tmp
+*.html
+codigo_para_ec2.R
+data
+pruebas_con_data-frame.R
+documento.Rmd
